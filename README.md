@@ -3,6 +3,10 @@ This is an open-source project exploring the usage of diffusion in training-free
 
 Additional research papers and resources are provided within this GitHub repository, primarily under the section titled: "Research Papers." While this is an attempt to understand diffusion LLMs, some implementation of such LLMs will be included in the GitHub repository, and may be a re-implementation of existing work. Thus, we do not claim any exclusive rights to any of the code, papers, nor knowledge provided here.
 
+Additional links:
+**https://nvlabs.github.io/Fast-dLLM/**
+**https://github.com/ZHZisZZ/dllm**
+
 ## The Problem with Autoregressive Models
 Every LLM you've ever heard of: ChatGPT, LLaMA, Claude, Gemini, etc. is **autoregressive**. This means, that it generates one token at a time, from left to right. Mathematically, this means that the LLM model with parameters $\theta$ models the probability distribution $P(x, \theta) = \prod P(x_n | x < n; \theta)$. While this formula seems complicated, this is essentially the product rule in discrete mathematics, counting, and probability, which states that if, for $n_1$ ways to complete a task, $T_1$, there are $n_2$ ways to complete a task, $T_2$, there are $n_1 \cdot n_2$ ways to complete both tasks. Obviously, this continues for more tasks. This is applied to output generation as the probability of producing some text $x = \text{This is an open source repository}$ is $P(\text{this}) \cdot P(\text{is} | \text{this}) \cdot P(\text{an} | \text{this is})...$.
 
