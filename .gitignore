@@ -1,2 +1,7 @@
 distilbert-base-uncased-finetuned-imdb/
 ServerInfo.md
+Miniconda3-latest-Linux-x86-64.sh
+fastdllm-env/
+miniconda3/
+python_env/
+server_env/
