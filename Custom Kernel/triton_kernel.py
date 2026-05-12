@@ -5,6 +5,17 @@ import triton.language as tl
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
+# Triton kernels implementing the token skipping policy from Fast-dLLM V2.
+# Policy Report (Xinze Feng, Feb. 2026).
+
+# Key Functions:
+#   - token_similiarity_check: computes cosine similarity between hidden states
+#       and updates freeze counters / active mask
+#   - sparse_attention_forward: fused attention over active tokens only
+#   - sparse_attention: Python launcher for sparse_attention_forward
+#   - update_hidden_cache: copies new hidden states into cache for active tokens
+#   - sparse_decoding_step: integration wrapper tying all of the above together
+
 @triton.jit
 def token_similarity_check(
     current_hidden_ptr, # pointer to current hidden states [batch, seq_len, d_model]
