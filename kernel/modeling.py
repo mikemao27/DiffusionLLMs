@@ -781,7 +781,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                     )
                     logits, past_key_values = output.logits, output.past_key_values
                     
-                    # 收集输出信息
+                    # Collect output info
                     if output_scores:
                         scores_list.append(logits)
                     if output_hidden_states and hasattr(output, 'hidden_states'):
