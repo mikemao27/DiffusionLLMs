@@ -1,9 +1,21 @@
 """
 Fast-dLLM Qwen Model Configuration.
 
+Job: define the HuggingFace-compatible configuration class for the Fast-dLLM
+v2 / Qwen2.5 architecture used throughout kernel/modeling.py.
+
 Standalone version of the configuration class. Placed in kernel/ so that
 kernel/modeling.py can import it without a relative package import, and so the
 model registers correctly with HuggingFace's from_pretrained() machinery.
+
+Interface contract (never changes):
+    - Fast_dLLM_QwenConfig is a plain PretrainedConfig subclass. All fields are
+      stored as plain attributes on the instance, exactly as HuggingFace's
+      from_pretrained() / from_dict() / to_dict() machinery expects.
+    - The constructor never raises for malformed rope_scaling or layer_types;
+      validation failures are swallowed so that a partially-specified config
+      (e.g. one built by hand, rather than loaded from a checkpoint) still
+      loads. This mirrors the upstream Qwen2 config behavior.
 """
 
 from transformers.configuration_utils import PretrainedConfig
@@ -13,6 +25,13 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 def _layer_type_validation(layer_types):
+    """
+    Raises ValueError if any entry in layer_types is not a recognized
+    attention type string.
+
+    Args:
+        - layer_types: list of per-layer attention type strings.
+    """
     valid = {"full_attention", "sliding_attention"}
     for t in layer_types:
         if t not in valid:
@@ -24,26 +43,29 @@ class Fast_dLLM_QwenConfig(PretrainedConfig):
     that from_pretrained() can load and populate all fields from config.json.
 
     Args:
-    - vocab_size: vocabulary size.
-    - hidden_size: transformer hidden dimension.
-    - intermediate_size: MLP intermediate dimension.
-    - num_hidden_layers: number of decoder layers.
-    - num_attention_heads: number of query heads.
-    - num_key_value_heads: number of KV heads (GQA).
-    - hidden_act: activation function name (e.g. "silu").
-    - max_position_embeddings: maximum sequence length for RoPE.
-    - initializer_range: std for weight initialization.
-    - rms_norm_eps: epsilon for RMSNorm.
-    - use_cache: whether to use KV cache during inference.
-    - tie_word_embeddings: whether to tie input/output embeddings.
-    - rope_theta: RoPE base frequency.
-    - rope_scaling: optional dict for dynamic RoPE variants.
-    - use_sliding_window: whether any layers use sliding window attention.
-    - sliding_window: sliding window size.
-    - max_window_layers: layers at or above this index use sliding attention.
-    - layer_types: list of attention type strings per layer. Auto-derived if None.
-    - attention_dropout: dropout probability in attention.
-    - bd_size: block-diffusion block size (tokens per generation block).
+        - vocab_size: vocabulary size.
+        - hidden_size: transformer hidden dimension.
+        - intermediate_size: MLP intermediate dimension.
+        - num_hidden_layers: number of decoder layers.
+        - num_attention_heads: number of query heads.
+        - num_key_value_heads: number of KV heads (GQA). Defaults to
+        num_attention_heads (no GQA) if left as None.
+        - hidden_act: activation function name (e.g. "silu").
+        - max_position_embeddings: maximum sequence length for RoPE.
+        - initializer_range: standard deviation used for weight initialization.
+        - rms_norm_eps: epsilon added inside RMSNorm for numerical stability.
+        - use_cache: whether to use the KV cache during inference.
+        - tie_word_embeddings: whether to tie the input and output embeddings.
+        - rope_theta: RoPE base frequency.
+        - rope_scaling: optional dict configuring dynamic RoPE variants.
+        - use_sliding_window: whether any layers use sliding-window attention.
+        - sliding_window: sliding window size, only used if use_sliding_window.
+        - max_window_layers: layers at or above this index use sliding attention;
+        layers below it use full attention.
+        - layer_types: list of attention type strings, one per layer. Derived
+        automatically from use_sliding_window / max_window_layers if left None.
+        - attention_dropout: dropout probability applied inside attention.
+        - bd_size: block-diffusion block size (tokens per generation block).
     """
 
     model_type = "Fast_dLLM_Qwen"
@@ -83,6 +105,8 @@ class Fast_dLLM_QwenConfig(PretrainedConfig):
         self.sliding_window = sliding_window if use_sliding_window else None
         self.max_window_layers = max_window_layers
 
+        # GQA: if num_key_value_heads is left unset, fall back to full
+        # multi-head attention (one KV head per query head).
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
@@ -96,14 +120,19 @@ class Fast_dLLM_QwenConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.bd_size = bd_size
 
+        # BC: some configs use the older key "type" instead of "rope_type".
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
+        # Validation is best-effort: a hand-built or partially-specified
+        # config should still load rather than crash at construction time.
         try:
             rope_config_validation(self)
         except Exception:
             pass
 
+        # Auto-derive layer_types from use_sliding_window / max_window_layers
+        # when the caller hasn't specified them explicitly.
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [

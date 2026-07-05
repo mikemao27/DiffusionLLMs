@@ -1,6 +1,9 @@
 """
 Test and Evaluation Harness for KV Block Eviction.
 
+Job: verify the eviction hook is a correctness no-op at K=N, then measure
+accuracy and throughput across a range of K values on GSM8K.
+
 Two entry points:
 
   python test_eviction.py --mode noop
@@ -32,7 +35,7 @@ from kernel.block_eviction_scheduler import BlockEvictionScheduler
 
 BLOCK_SIZE = 32
 DEFAULT_MODEL = "Efficient-Large-Model/Fast_dLLM_v2_7B"
-FILLER = "The quick brown fox jumps over the lazy dog. " * 200
+FILLER_SENTENCE = "The quick brown fox jumps over the lazy dog. "
 
 def load_model(model_path, device = "cuda:0"):
     """
@@ -41,8 +44,11 @@ def load_model(model_path, device = "cuda:0"):
     attention forward without trust_remote_code.
 
     Args:
-    - model_path: HuggingFace repo ID or local path.
-    - device: target CUDA device string.
+        - model_path: HuggingFace repo ID or local path.
+        - device: target CUDA device string.
+
+    Returns:
+        - the loaded model, in eval mode, with .mdm_sample bound.
     """
     model = Fast_dLLM_QwenForCausalLM.from_pretrained(
         model_path,
@@ -53,6 +59,32 @@ def load_model(model_path, device = "cuda:0"):
     setup_model(model)
     return model
 
+def _build_filler_ids(tokenizer, min_tokens):
+    """
+    Builds a filler token-id tensor with at least min_tokens tokens by
+    repeating FILLER_SENTENCE, doubling the repeat count until long enough.
+
+    Why this exists: a fixed-size filler constant silently caps out at
+    whatever it tokenizes to -- past that length, _make_prompt pads with
+    everything available and stops, with no error, producing a prompt far
+    shorter than the requested target_ctx_len. Building the filler on demand
+    means --context_len works correctly at any length, including ones larger
+    than previously tested.
+
+    Args:
+        - tokenizer: the model tokenizer.
+        - min_tokens: minimum number of filler tokens required.
+
+    Returns:
+        - a 1-D LongTensor of at least min_tokens token ids.
+    """
+    reps = max(200, (min_tokens // 8) + 1)  # ~8 tokens/sentence, rough starting guess
+    while True:
+        ids = tokenizer(FILLER_SENTENCE * reps, return_tensors = "pt").input_ids[0]
+        if len(ids) >= min_tokens:
+            return ids
+        reps *= 2
+
 def _make_prompt(tokenizer, question, target_ctx_len = None):
     """
     Build a chat-templated prompt for a GSM8K question. If target_ctx_len is given,
@@ -60,9 +92,12 @@ def _make_prompt(tokenizer, question, target_ctx_len = None):
     model in a long-context regime where block eviction has real blocks to prune.
 
     Args:
-    - tokenizer: the model tokenizer.
-    - question: raw question string.
-    - target_ctx_len: optional token count to pad the prompt to.
+        - tokenizer: the model tokenizer.
+        - question: raw question string.
+        - target_ctx_len: optional token count to pad the prompt to.
+
+    Returns:
+        - the chat-templated prompt string.
     """
     filler_prefix = ""
     if target_ctx_len is not None:
@@ -74,7 +109,7 @@ def _make_prompt(tokenizer, question, target_ctx_len = None):
         base_len = len(tokenizer(base, return_tensors = "pt").input_ids[0])
         need = max(0, target_ctx_len - base_len)
         if need > 0:
-            fids = tokenizer(FILLER, return_tensors = "pt").input_ids[0]
+            fids = _build_filler_ids(tokenizer, need)
             filler_prefix = tokenizer.decode(fids[:need], skip_special_tokens = True) + " "
 
     content = filler_prefix + question
@@ -85,10 +120,25 @@ def _make_prompt(tokenizer, question, target_ctx_len = None):
     )
 
 def _extract_gsm8k_answer(text):
+    """
+    Pulls the final "#### N" answer out of a GSM8K reference solution string.
+    """
     m = re.search(r"####\s*([\d,]+)", text)
     return m.group(1).replace(",", "") if m else None
 
 def _check_answer(generated, ground_truth):
+    """
+    Checks a generated answer against ground truth. Prefers an explicit
+    "#### N" marker in the generation; falls back to the last number
+    mentioned if no marker is present.
+
+    Args:
+        - generated: the model's generated text.
+        - ground_truth: the reference answer string, or None (unscored sample).
+
+    Returns:
+        - True/False if scored, or None if ground_truth was None.
+    """
     if ground_truth is None:
         return None
     m = re.search(r"####\s*([\d,]+)", generated)
@@ -97,17 +147,20 @@ def _check_answer(generated, ground_truth):
     nums = re.findall(r"\b\d+(?:,\d+)*\b", generated)
     return bool(nums) and nums[-1].replace(",", "") == ground_truth
 
+
 def load_gsm8k_batched(n, tokenizer, device, batch_size, target_ctx_len = None):
     """
     Load n GSM8K test questions and batch them with left-padding.
-    Returns a list of (encoded_batch, answers) tuples.
 
     Args:
-    - n: number of questions to load.
-    - tokenizer: the model tokenizer.
-    - device: CUDA device string.
-    - batch_size: number of questions per batch.
-    - target_ctx_len: optional token count to pad prompts to.
+        - n: number of questions to load.
+        - tokenizer: the model tokenizer.
+        - device: CUDA device string.
+        - batch_size: number of questions per batch.
+        - target_ctx_len: optional token count to pad prompts to.
+
+    Returns:
+        - a list of (encoded_batch, answers) tuples.
     """
     ds = load_dataset("gsm8k", "main", split = "test")
     questions = ds[:n]["question"]
@@ -134,6 +187,36 @@ def load_gsm8k_batched(n, tokenizer, device, batch_size, target_ctx_len = None):
         )
     return batches
 
+def warm_up_model(model, tokenizer, device):
+    """
+    Runs one small, untimed generation call to absorb one-time costs (CUDA
+    context growth, cuDNN algorithm selection, memory allocator warm-up) that
+    would otherwise land inside whichever measurement happens to run first.
+
+    Why this matters: across repeated eval-sweep runs, the K-value throughput
+    numbers were consistently stable (within ~0.3% run to run) while the
+    baseline (full-prefix, always measured first) varied by up to ~26%. That
+    pattern -- stable everywhere except the first timed call in the process --
+    is the signature of warm-up cost, not GPU contention or thermal state.
+    Running a throwaway generation before any timed measurement keeps that
+    cost out of the results entirely.
+
+    Args:
+        - model: model instance with mdm_sample bound.
+        - tokenizer: the model tokenizer.
+        - device: CUDA device string.
+
+    Returns:
+        - None.
+    """
+    dummy_text = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "What is 2 + 2?"}],
+        tokenize = False,
+        add_generation_prompt = True,
+    )
+    input_ids = tokenizer(dummy_text, return_tensors = "pt").input_ids.to(device)
+    run_generation(model, tokenizer, input_ids, max_new_tokens = 32)
+
 def run_generation(
     model,
     tokenizer,
@@ -143,16 +226,20 @@ def run_generation(
     temperature = 0.0,
 ):
     """
-    Run batch_sample on a single input_ids tensor. Returns a dict mapping
-    sample index to output token tensor (the full sequence including prompt).
+    Run batch_sample on a single input_ids tensor.
 
     Args:
-    - model: model instance with mdm_sample bound.
-    - tokenizer: the model tokenizer.
-    - input_ids: [B, L] token tensor on the correct device.
-    - max_new_tokens: maximum tokens to generate.
-    - threshold: unmasking confidence threshold.
-    - temperature: sampling temperature (0 = greedy).
+        - model: model instance with mdm_sample bound.
+        - tokenizer: the model tokenizer.
+        - input_ids: [B, L] token tensor on the correct device.
+        - max_new_tokens: maximum tokens to generate.
+        - threshold: unmasking confidence threshold.
+        - temperature: sampling temperature (0 = greedy).
+
+    Returns:
+        - ordered: list of output token tensors, one per input row, each
+            containing the full sequence including the prompt.
+        - elapsed: wall-clock seconds for the generation call.
     """
     plen = input_ids.shape[1]
     seq_len = torch.full((input_ids.shape[0],), plen, dtype = torch.long, device = input_ids.device)
@@ -182,17 +269,23 @@ def run_noop_test(
     n_examples = 3,
     context_len = None,
     union_mode = "matmul",
+    use_sparse_kernel = False,
 ):
     """
     Verify K = N+10 produces token-identical output to the baseline.
 
     Args:
-    - model: model instance with mdm_sample bound.
-    - tokenizer: the model tokenizer.
-    - device: CUDA device string.
-    - n_examples: number of GSM8K questions to test.
-    - context_len: optional token count to pad prompts to.
-    - union_mode: union strategy passed to BlockEvictionScheduler.
+        - model: model instance with mdm_sample bound.
+        - tokenizer: the model tokenizer.
+        - device: CUDA device string.
+        - n_examples: number of GSM8K questions to test.
+        - context_len: optional token count to pad prompts to.
+        - union_mode: union strategy passed to BlockEvictionScheduler.
+        - use_sparse_kernel: whether to also exercise the Triton sparse kernel
+            path during the no-op check.
+
+    Returns:
+        - True if every example was token-identical to baseline, else False.
     """
     print(f"\nNo-op correctness test (union_mode = {union_mode})")
     ds = load_dataset("gsm8k", "main", split = "test")
@@ -213,7 +306,8 @@ def run_noop_test(
         base_tokens = base_out[0]
 
         scheduler = BlockEvictionScheduler(
-            model, k = k_noop, block_size = BLOCK_SIZE, union_mode = union_mode
+            model, k = k_noop, block_size = BLOCK_SIZE, union_mode = union_mode,
+            use_sparse_kernel = use_sparse_kernel,
         )
         with scheduler:
             topk_out, _ = run_generation(model, tokenizer, input_ids)
@@ -265,22 +359,28 @@ def run_eval_sweep(
     threshold = 0.95,
     temperature = 0.0,
     max_new_tokens = 512,
+    use_sparse_kernel = False,
 ):
     """
     Sweep over k_values and compare accuracy + throughput against the dense baseline.
 
     Args:
-    - model: model instance with mdm_sample bound.
-    - tokenizer: the model tokenizer.
-    - device: CUDA device string.
-    - k_values: list of K values to evaluate.
-    - n_questions: number of GSM8K questions to evaluate on.
-    - batch_size: questions per batch.
-    - context_len: optional token count to pad prompts to.
-    - union_mode: union strategy passed to BlockEvictionScheduler.
-    - threshold: unmasking confidence threshold.
-    - temperature: sampling temperature (0 = greedy).
-    - max_new_tokens: maximum tokens to generate per question.
+        - model: model instance with mdm_sample bound.
+        - tokenizer: the model tokenizer.
+        - device: CUDA device string.
+        - k_values: list of K values to evaluate.
+        - n_questions: number of GSM8K questions to evaluate on.
+        - batch_size: questions per batch.
+        - context_len: optional token count to pad prompts to.
+        - union_mode: union strategy passed to BlockEvictionScheduler.
+        - threshold: unmasking confidence threshold.
+        - temperature: sampling temperature (0 = greedy).
+        - max_new_tokens: maximum tokens to generate per question.
+        - use_sparse_kernel: whether to use the Triton sparse kernel path.
+
+    Returns:
+        - a list of (k, accuracy, tok_per_sec, speedup, frac_kv_loaded) tuples,
+            one per value in k_values.
     """
     print(
         f"\nLoading {n_questions} GSM8K questions "
@@ -289,6 +389,14 @@ def run_eval_sweep(
     batches = load_gsm8k_batched(n_questions, tokenizer, device, batch_size, context_len)
 
     def evaluate_k(k):
+        """
+        Runs the full batch set once, either at the dense baseline (k=None)
+        or with a BlockEvictionScheduler installed at the given k.
+
+        Returns:
+            - (accuracy, tok_per_sec, avg_frac_loaded, sparse_diag) where
+                sparse_diag is (hits, misses, hit_rate, rebuild_misses).
+        """
         correct = 0
         total = 0
         total_new_tokens = 0
@@ -297,7 +405,8 @@ def run_eval_sweep(
         scheduler = None
         if k is not None:
             scheduler = BlockEvictionScheduler(
-                model, k = k, block_size = BLOCK_SIZE, union_mode = union_mode
+                model, k = k, block_size = BLOCK_SIZE, union_mode = union_mode,
+                use_sparse_kernel = use_sparse_kernel,
             )
             scheduler.install()
 
@@ -323,26 +432,36 @@ def run_eval_sweep(
                         total += 1
         finally:
             if scheduler is not None:
+                sparse_stats = scheduler.sparse_kernel_stats
                 scheduler.uninstall()
 
         tok_per_sec = total_new_tokens / total_time if total_time > 0 else 0.0
         accuracy = correct / total if total > 0 else 0.0
         avg_n, avg_u, avg_frac = scheduler.avg_stats if scheduler is not None else (0, 0, 0.0)
-        return accuracy, tok_per_sec, avg_frac
+        sparse_diag = sparse_stats if scheduler is not None else (0, 0, 0.0, 0)
+        return accuracy, tok_per_sec, avg_frac, sparse_diag
 
     print("\nEvaluating baseline (full prefix) ...")
-    base_acc, base_tok_s, _ = evaluate_k(None)
+    base_acc, base_tok_s, _, _ = evaluate_k(None)
     print(f"  baseline: acc = {base_acc:.3f}  tok/s = {base_tok_s:.1f}")
 
     results = []
     for k in k_values:
         print(f"\nEvaluating K = {k} (union_mode = {union_mode}) ...")
-        acc, tok_s, frac = evaluate_k(k)
+        acc, tok_s, frac, sparse_diag = evaluate_k(k)
         speedup = tok_s / base_tok_s if base_tok_s > 0 else 0.0
         print(
             f"  K = {k}: acc = {acc:.3f}  tok/s = {tok_s:.1f}  "
             f"speedup = {speedup:.2f}x  frac_loaded = {frac:.2%}"
         )
+        if use_sparse_kernel:
+            hits, misses, hit_rate, rebuild_misses = sparse_diag
+            other_misses = misses - rebuild_misses
+            print(
+                f"    [sparse kernel] hits = {hits}  misses = {misses}  "
+                f"hit_rate = {hit_rate:.1%}  "
+                f"(rebuild_misses = {rebuild_misses}, other_misses = {other_misses})"
+            )
         results.append((k, acc, tok_s, speedup, frac))
 
     print("\nResults Summary:")
@@ -353,6 +472,9 @@ def run_eval_sweep(
     return results
 
 def main():
+    """
+    Parses CLI args and dispatches to run_noop_test or run_eval_sweep.
+    """
     parser = argparse.ArgumentParser(description = "Block eviction kernel tests and evaluation")
     parser.add_argument("--mode", choices = ["noop", "eval"], default = "noop",
                         help = "noop: correctness gate; eval: accuracy+throughput sweep")
@@ -369,6 +491,9 @@ def main():
     parser.add_argument("--union_mode", choices = ["matmul", "naive"], default = "matmul",
                         help = "matmul: global top-K (smaller union); "
                                "naive: per-sequence union (baseline behavior)")
+    parser.add_argument("--use_sparse_kernel", action = "store_true",
+                        help = "Use the Triton sparse_attn_merge kernel instead of "
+                               "gather+cat+SDPA for the small-step attention path.")
     parser.add_argument("--threshold", type = float, default = 0.95)
     parser.add_argument("--temperature", type = float, default = 0.0)
     parser.add_argument("--max_new_tokens", type = int, default = 512)
@@ -378,12 +503,16 @@ def main():
     model = load_model(args.model, device = args.device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code = True)
 
+    print("Warming up (absorbing one-time CUDA/cuDNN/allocator costs) ...")
+    warm_up_model(model, tokenizer, args.device)
+
     if args.mode == "noop":
         passed = run_noop_test(
             model, tokenizer, args.device,
             n_examples = args.n_examples,
             context_len = args.context_len,
             union_mode = args.union_mode,
+            use_sparse_kernel = args.use_sparse_kernel,
         )
         sys.exit(0 if passed else 1)
     else:
@@ -397,6 +526,7 @@ def main():
             threshold = args.threshold,
             temperature = args.temperature,
             max_new_tokens = args.max_new_tokens,
+            use_sparse_kernel = args.use_sparse_kernel,
         )
 
 if __name__ == "__main__":
