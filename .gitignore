@@ -1,2 +1,24 @@
+# Folders to Hide
+.venv
 __pycache__/
+*.pyc
+*.pyo
+*.egg-info
+dist
+build
+.pytest_cache
+
+# Environment Variables to Hide
+.env
+.env.*
 .vscode
+
+# Show Example .env File for Users to Replicate
+!.env.example
+
+# Editor and IDE Settings
+.vscode/settings.json
+.idea
+
+# Profiler output (large, regenerated locally)
+profile_trace.json
