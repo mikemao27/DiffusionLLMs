@@ -1,4 +1,4 @@
-<h1 align = "center">DiffusionLLMs</h1>
+<h1 align = "center">Custom Kernels for Fast-dLLM Wall-clock Runtime Improvements</h1>
 
 **DiffusionLLMs** is a project developing a custom Triton kernel for **KV cache block eviction** and **block-sparse attention**, targeting inference speedups for [Fast-dLLM v2](https://github.com/NVlabs/Fast-dLLM), a masked diffusion language model that generates text block-by-block rather than token-by-token. The aim is to bound prefix attention cost to a fixed top-K block budget instead of letting it grow linearly with sequence length, without sacrificing the accuracy of the underlying model.
 
