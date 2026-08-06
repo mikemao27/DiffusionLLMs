@@ -3,28 +3,29 @@ Block Importance Scoring Kernel (key-norm proxy).
 
 Scores N prefix blocks by an attention-free proxy signal, for use as a block-selection method when true attention weights are not available.
 
-STATUS: NOT CURRENTLY WIRED IN. BlockEvictionScheduler (block_eviction_scheduler.py) scores blocks directly from captured attention weights (_last_attn_weights), 
-which is a strictly more accurate signal than the key-norm proxy implemented here, since it doesn't need a proxy at all. 
-Nothing in this codebase currently imports score_blocks(). This file is kept as an alternative/fallback scoring strategy for cases where attention-weight 
-capture isn't available (e.g. before the _capture_attn_scores hook existed). If you don't need that fallback, this file and its Triton kernel can be deleted with no effect on the eviction path.
+STATUS: NOT CURRENTLY WIRED IN. BlockEvictionScheduler (block_eviction_scheduler.py) scores blocks directly from captured attention weights (_last_attn_weights), which is a
+strictly more accurate signal than the key-norm proxy implemented here, since it doesn't need a proxy at all. Nothing in this codebase currently imports score_blocks(). This
+file is kept as an alternative/fallback scoring strategy for cases where attention-weight capture isn't available (e.g. before the _capture_attn_scores hook
+existed). If you don't need that fallback, this file and its Triton kernel can be deleted with no effect on the eviction path.
 
-Scores N prefix blocks by computing the mean squared L2 norm of key vectors within each block, averaged across all KV heads and all transformer layers. 
-The result is a [B, N] importance tensor, in the same shape BlockEvictionScheduler expects if it were wired in to use this scoring method instead.
+Scores N prefix blocks by computing the mean squared L2 norm of key vectors within each block, averaged across all KV heads and all transformer layers. The result is a [B, N]
+importance tensor, in the same shape BlockEvictionScheduler expects if it were wired in to use this scoring method instead.
 
-Key norms are used as the scoring signal because ideally we would use softmax attention weights, but those require a query tensor which is not available at score time 
-(the commit step has already returned). Key vector norms are a well-established proxy: tokens with large key magnitudes attract more attention mass, and the correlation 
-with true attention weights is strong enough for block selection purposes. MInference and H2O both use variants of this proxy.
+Key norms are used as the scoring signal because ideally we would use softmax attention weights, but those require a query tensor which is not available at score time (the
+commit step has already returned). Key vector norms are a well-established proxy: tokens with large key magnitudes attract more attention mass, and the correlation with true
+attention weights is strong enough for block selection purposes. MInference and H2O both use variants of this proxy.
 
-A Triton kernel is used instead of PyTorch because the naive Python loop over layers does [L layers] x [B x H_kv x S x D -> B x S -> B x N], 
-and each step materializes an intermediate tensor. For a 28-layer Qwen2.5-7B model with a 2048-token prefix this is 28 separate .norm() and .mean() calls, each launching their own CUDA kernels. 
-The Triton kernel fuses all layers and the block-reduction into a single pass over HBM, reading each key tensor once and writing only the final [B, N] score matrix.
+A Triton kernel is used instead of PyTorch because the naive Python loop over layers does [L layers] x [B x H_kv x S x D -> B x S -> B x N], and each step materializes an
+intermediate tensor. For a 28-layer Qwen2.5-7B model with a 2048-token prefix this is 28 separate .norm() and .mean() calls, each launching their own CUDA kernels. The Triton
+kernel fuses all layers and the block-reduction into a single pass over HBM, reading each key tensor once and writing only the final [B, N] score matrix.
 
-Kernel design: the grid is [B, N_blocks, H_kv], and each program handles one (batch, block, head) triple. It loops over the D = 128 dimensions and block_size = 32 tokens in that block, 
-accumulating the sum of squared values as a scalar float32, then atomically adds that scalar into out[b, block_idx]. The key correctness point is that block_sum must be a scalar (f32), 
-not a tensor, because tl.atomic_add expects ptr<f32> vs f32, not ptr<f32> vs tensor<1xf32>. The accumulation uses a plain Python float variable pattern via a 1-D tensor reduced to scalar with tl.sum before the atomic.
+Kernel design: the grid is [B, N_blocks, H_kv], and each program handles one (batch, block, head) triple. It loops over the D = 128 dimensions and block_size = 32 tokens in
+that block, accumulating the sum of squared values as a scalar float32, then atomically adds that scalar into out[b, block_idx]. The key correctness point is that block_sum
+must be a scalar (f32), not a tensor, because tl.atomic_add expects ptr<f32> vs f32, not ptr<f32> vs tensor<1xf32>. The accumulation uses a plain Python float variable pattern
+via a 1-D tensor reduced to scalar with tl.sum before the atomic.
 
-Interface contract (never changes): score_blocks() takes the full per-layer key caches and returns one score per complete block. It never mutates its inputs. Higher score means more important, 
-meaning more likely to be kept if this scorer were wired into BlockEvictionScheduler's selection logic.
+Interface contract (never changes): score_blocks() takes the full per-layer key caches and returns one score per complete block. It never mutates its inputs. Higher score
+means more important, meaning more likely to be kept if this scorer were wired into BlockEvictionScheduler's selection logic.
 """
 
 import torch
@@ -48,13 +49,13 @@ def _score_blocks_kernel(
     stride_on,
 ):
     """
-    One program per (batch, block_idx, head) triple. Computes the sum of squared values of all key vectors in this block 
-    (block_size tokens x D dimensions), then atomically adds the scalar result into out[b, block_idx].
+    One program per (batch, block_idx, head) triple. Computes the sum of squared values of all key vectors in this block (block_size tokens x D dimensions), then atomically
+    adds the scalar result into out[b, block_idx].
 
-    keys_ptr is the [B, H_kv, S, D] float32 key tensor (row-major), and out_ptr is the [B, N_blocks] 
-    float32 output, pre-zeroed. B is the batch size, H_kv is the number of KV heads, and S is the full prefix sequence length. D is the head dimension 
-    (constexpr, must be power of 2, e.g. 128), and block_size is the tokens per generation block (constexpr, e.g. 32). n_blocks is the number of complete blocks 
-    (S // block_size). stride_b, stride_h, and stride_s are key tensor strides (in elements), and stride_ob and stride_on are output tensor strides (in elements).
+    keys_ptr is the [B, H_kv, S, D] float32 key tensor (row-major), and out_ptr is the [B, N_blocks] float32 output, pre-zeroed. B is the batch size, H_kv is the number of
+    KV heads, and S is the full prefix sequence length. D is the head dimension (constexpr, must be power of 2, e.g. 128), and block_size is the tokens per
+    generation block (constexpr, e.g. 32). n_blocks is the number of complete blocks (S // block_size). stride_b, stride_h, and stride_s are key tensor strides (in elements), 
+    and stride_ob and stride_on are output tensor strides (in elements).
 
     Returns nothing; atomically accumulates into out_ptr.
     """
@@ -89,8 +90,8 @@ def _score_blocks_kernel(
 
 def score_blocks(key_cache_layers: list, block_size: int = 32) -> torch.Tensor:
     """
-    Compute per-block importance scores from all layers of the KV key cache. key_cache_layers is a list of [B, H_kv, S, D] 
-    key tensors, one per layer, where None entries are skipped. block_size is the number of tokens per block.
+    Compute per-block importance scores from all layers of the KV key cache. key_cache_layers is a list of [B, H_kv, S, D] key tensors, one per layer, where None
+    entries are skipped. block_size is the number of tokens per block.
 
     Returns a [B, N_blocks] float32 tensor of block importance scores, where N_blocks = S // block_size.
     """

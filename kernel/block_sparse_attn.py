@@ -1,45 +1,40 @@
 """
 Block-Sparse Flash Attention Kernel.
 
-Computes attention over only the K selected prefix KV blocks, without ever loading the evicted blocks from HBM. 
-Implements Flash Attention 2 with a block-sparse KV mask: instead of iterating over all N prefix blocks in the outer KV loop, 
-we iterate only over the K selected blocks. Evicted blocks are never loaded from HBM. This is the primary throughput lever. 
-The speedup over dense attention is approximately:
+Computes attention over only the K selected prefix KV blocks, without ever loading the evicted blocks from HBM. Implements Flash Attention 2 with a block-sparse KV mask:
+instead of iterating over all N prefix blocks in the outer KV loop, we iterate only over the K selected blocks. Evicted blocks are never loaded from HBM. This is the primary
+throughput lever. The speedup over dense attention is approximately: speedup ~= N_prefix / (2 * K_selected + N_current_block)
 
-    speedup ~= N_prefix / (2 * K_selected + N_current_block)
-
-At K = 16, N = 64, block_size = 32 (the settings from the slides showing 1.35x with naive union), the theoretical ceiling with a perfect sparse kernel is:
-
-    64 / (2 * 16 + 1) ~= 1.94x
+At K = 16, N = 64, block_size = 32 (the settings from the slides showing 1.35x with naive union), the theoretical ceiling with a perfect sparse kernel is: 64 / (2 * 16 + 1) ~= 1.94x
 
 The naive union was expanding K_effective to ~25 blocks (25.6% KV loaded). The matmul union keeps it at exactly K = 16 blocks, pushing toward the ceiling.
 
-Fast-dLLM v2 specifics: the Q shape (small step) is [B, H_q = 28, block_size = 32, D = 128], the KV prefix shape is [B, H_kv = 4, K * block_size, D = 128] 
-(after eviction selection), and the KV current shape is [B, H_kv = 4, block_size = 32, D = 128]. This is GQA: each KV head serves H_q / H_kv = 7 query heads. 
-There is no causal mask within the current block (Fast-dLLM uses bidirectional attention within the generation block, not causal); the prefix is attended to causally at the block level.
+Fast-dLLM v2 specifics: the Q shape (small step) is [B, H_q = 28, block_size = 32, D = 128], the KV prefix shape is [B, H_kv = 4, K * block_size, D = 128] (after eviction selection), 
+and the KV current shape is [B, H_kv = 4, block_size = 32, D = 128]. This is GQA: each KV head serves H_q / H_kv = 7 query heads. There is no causal mask within the current block 
+(Fast-dLLM uses bidirectional attention within the generation block, not causal); the prefix is attended to causally at the block level.
 
-Kernel design follows Flash Attention 2 section 3.1: the outer loop runs over selected KV blocks (K iterations, not N), with inner tiling of BLOCK_M query tokens by BLOCK_N KV tokens per SRAM tile. 
-Each SM handles one (batch, query_head) pair. The KV loop loads one tile of K and V from HBM per selected block, accumulates the online softmax running statistics (m, l) and the output accumulator 
-O in registers, then writes O back to HBM once after all K blocks are processed. The block_indices tensor [K] tells the kernel which KV blocks to load, in sorted order. Within each selected block, 
-the kernel loads block_size = 32 KV vectors, so each KV SRAM tile covers exactly one generation block.
+Kernel design follows Flash Attention 2 section 3.1: the outer loop runs over selected KV blocks (K iterations, not N), with inner tiling of BLOCK_M query tokens by BLOCK_N KV
+tokens per SRAM tile. Each SM handles one (batch, query_head) pair. The KV loop loads one tile of K and V from HBM per selected block, accumulates the online softmax running
+statistics (m, l) and the output accumulator O in registers, then writes O back to HBM once after all K blocks are processed. The block_indices tensor [K] tells the kernel
+which KV blocks to load, in sorted order. Within each selected block, the kernel loads block_size = 32 KV vectors, so each KV SRAM tile covers exactly one generation block.
 
-Memory traffic analysis: dense reads N * block_size * D * 2 (K + V) * H_kv bytes per forward pass, sparse reads K * block_size * D * 2 (K + V) * H_kv bytes per forward pass, and the ratio K/N matches 
-the "KV loaded" column in the benchmark slides.
+Memory traffic analysis: dense reads N * block_size * D * 2 (K + V) * H_kv bytes per forward pass, sparse reads K * block_size * D * 2 (K + V) * H_kv bytes per forward pass,
+and the ratio K/N matches the "KV loaded" column in the benchmark slides.
 
 GQA handling: the query head index h_q maps to KV head h_kv = h_q // num_kv_groups. We load K[h_kv] and V[h_kv] but Q[h_q], so there is no expand/repeat needed.
 
-Interface contract (never changes): block_sparse_attention() and block_sparse_attention_with_stats() take the full prefix K/V cache tensors plus a list of selected block indices, never a pre-gathered subset. 
-All HBM-traffic savings come from the kernel indexing into the full tensor itself, not from a Python-level slice before the call. block_sparse_attention_with_stats() and sparse_attn_merge() exist purely to 
-support merging this partial (prefix-only) attention result with a second partial result (the current generation block) via the Flash Decoding combine. Callers who only need prefix attention in isolation 
-should use block_sparse_attention() instead.
+Interface contract (never changes): block_sparse_attention() and block_sparse_attention_with_stats() take the full prefix K/V cache tensors plus a list
+of selected block indices, never a pre-gathered subset. All HBM-traffic savings come from the kernel indexing into the full tensor itself, not from a Python-level slice
+before the call. block_sparse_attention_with_stats() and sparse_attn_merge() exist purely to support merging this partial (prefix-only) attention result with a second
+partial result (the current generation block) via the Flash Decoding combine. Callers who only need prefix attention in isolation should use block_sparse_attention() instead.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-# Tile sizes. BLOCK_M covers the query sequence dimension (32 tokens per generation block, so BLOCK_M = 32 processes the entire Q in one tile).
-# BLOCK_N covers one KV block at a time (block_size = 32).
+# Tile sizes. BLOCK_M covers the query sequence dimension (32 tokens per generation block, so BLOCK_M = 32 processes the entire Q in one tile). BLOCK_N covers one KV
+# block at a time (block_size = 32).
 BLOCK_M: int = 32
 BLOCK_N: int = 32
 
@@ -68,15 +63,14 @@ def _block_sparse_attn_fwd_kernel(
     BLOCK_N: tl.constexpr,
 ):
     """
-    Forward kernel body. One program per (batch, query_head) pair. Iterates over only the K selected KV blocks (loaded from block_indices), 
-    accumulating a Flash Attention 2 online softmax in registers, and writes the final output once all blocks are processed.
+    Forward kernel body. One program per (batch, query_head) pair. Iterates over only the K selected KV blocks (loaded from block_indices), accumulating a Flash Attention
+    2 online softmax in registers, and writes the final output once all blocks are processed.
 
-    Q_ptr is the [B, H_q, S_q, D] query tensor. K_ptr and V_ptr are the [B, H_kv, S_kv_full, D] full prefix key and value tensors 
-    (indexed via block_indices to load only selected blocks). Out_ptr is the [B, H_q, S_q, D] output tensor (pre-zeroed). block_indices_ptr is a 
-    [B, n_kv_blocks] int32 tensor of selected block indices, and n_kv_blocks is the number of selected KV blocks (K, not N). scale is the softmax scaling factor (1/sqrt(D)). 
-    B, H_q, H_kv are the batch, query head, and KV head counts. S_q is the query sequence length (constexpr = block_size = 32) and S_kv is the full prefix sequence length (N * block_size). 
-    D is the head dimension (constexpr = 128), and num_kv_groups is H_q // H_kv (constexpr = 7 for Qwen2.5-7B). The stride_* arguments are tensor strides, and BLOCK_M / BLOCK_N are the 
-    tile sizes (constexpr, both = 32). Writes directly into Out_ptr and returns nothing.
+    Q_ptr is the [B, H_q, S_q, D] query tensor. K_ptr and V_ptr are the [B, H_kv, S_kv_full, D] full prefix key and value tensors (indexed via block_indices to load only selected blocks). 
+    Out_ptr is the [B, H_q, S_q, D] output tensor (pre-zeroed). block_indices_ptr is a [B, n_kv_blocks] int32 tensor of selected block indices, and n_kv_blocks is the number of selected KV blocks (K, not N). 
+    scale is the softmax scaling factor (1/sqrt(D)). B, H_q, H_kv are the batch, query head, and KV head counts. S_q is the query sequence length (constexpr = block_size = 32) 
+    and S_kv is the full prefix sequence length (N * block_size). D is the head dimension (constexpr = 128), and num_kv_groups is H_q // H_kv (constexpr = 7 for Qwen2.5-7B). The stride_* arguments 
+    are tensor strides, and BLOCK_M / BLOCK_N are the tile sizes (constexpr, both = 32). Writes directly into Out_ptr and returns nothing.
     """
     b = tl.program_id(0)
     h_q = tl.program_id(1)
@@ -149,17 +143,17 @@ def block_sparse_attention(
     block_size: int = 32,
 ) -> torch.Tensor:
     """
-    Compute attention over a sparse subset of prefix KV blocks. Q attends to only the blocks listed in block_indices, never loading the evicted blocks from HBM. 
-    This is the primary throughput lever: if K blocks are selected out of N total, HBM reads for K and V are reduced by factor N/K.
+    Compute attention over a sparse subset of prefix KV blocks. Q attends to only the blocks listed in block_indices, never loading the evicted blocks from HBM. This is
+    the primary throughput lever: if K blocks are selected out of N total, HBM reads for K and V are reduced by factor N/K.
 
-    Q is the [B, H_q, S_q, D] query tensor for the current generation block, where S_q = block_size = 32 (one generation block at a time). 
-    K_prefix and V_prefix are the [B, H_kv, S_kv, D] full prefix key and value tensors (not pre-sliced). block_indices is a [B, K] int32 tensor of selected block indices, 
-    sorted, where each value is a block index into the prefix (0-indexed, 0 = first 32 tokens). block_size is the tokens per block, which must match the generation block size (default 32).
+    Q is the [B, H_q, S_q, D] query tensor for the current generation block, where S_q = block_size = 32 (one generation block at a time). K_prefix and V_prefix are the [B, H_kv, S_kv, D] 
+    full prefix key and value tensors (not pre-sliced). block_indices is a [B, K] int32 tensor of selected block indices, sorted, where each value is a block index into the prefix (0-indexed, 0 = first 32 tokens). 
+    block_size is the tokens per block, which must match the generation block size (default 32).
 
     Returns a [B, H_q, S_q, D] float16 attention output.
 
-    Q, K, and V should be on the same CUDA device. K_prefix and V_prefix are the full cache tensors: the kernel uses block_indices to load only the selected tiles, 
-    so no Python-level gather is needed. The output does not include attention over the current generation block itself (handled separately by the model's standard attention).
+    Q, K, and V should be on the same CUDA device. K_prefix and V_prefix are the full cache tensors: the kernel uses block_indices to load only the selected tiles, so no
+    Python-level gather is needed. The output does not include attention over the current generation block itself (handled separately by the model's standard attention).
     """
     B, H_q, S_q, D = Q.shape
     _, H_kv, S_kv, _ = K_prefix.shape
@@ -168,11 +162,11 @@ def block_sparse_attention(
     scale = D ** -0.5
 
     assert S_q <= BLOCK_M, (
-        f"block_sparse_attention: S_q={S_q} > BLOCK_M={BLOCK_M}. "
+        f"block_sparse_attention: S_q = {S_q} > BLOCK_M = {BLOCK_M}. "
         "Increase BLOCK_M or process in sub-blocks."
     )
     assert block_size == BLOCK_N, (
-        f"block_sparse_attention: block_size={block_size} != BLOCK_N={BLOCK_N}. "
+        f"block_sparse_attention: block_size = {block_size} != BLOCK_N = {BLOCK_N}. "
         "Recompile the kernel with matching BLOCK_N."
     )
     assert D in (64, 128, 256), f"block_sparse_attention: unexpected head_dim {D}"
@@ -236,17 +230,17 @@ def _block_sparse_attn_stats_kernel(
     BLOCK_N: tl.constexpr,
 ):
     """
-    Same as _block_sparse_attn_fwd_kernel, but additionally writes the raw (un-normalized) accumulator and the online softmax statistics (m, l), 
-    so a caller can correctly merge this partial attention result with another partial result (e.g. the current generation block's self-attention) using the Flash Decoding log-sum-exp combine.
+    Same as _block_sparse_attn_fwd_kernel, but additionally writes the raw (un-normalized) accumulator and the online softmax statistics (m, l), so a caller
+    can correctly merge this partial attention result with another partial result (e.g. the current generation block's self-attention) using the Flash Decoding log-sum-exp combine.
 
-    A separate raw accumulator is required because the online softmax update at each step rescales acc by 1/l_new before adding the new contribution, 
-    so acc is already the normalized output by the time the loop ends (Out = acc). If a caller took that normalized Out and multiplied it by l again during a merge, 
-    the l term would be double-counted, corrupting the result. Acc_ptr instead stores acc * l_i, which recovers the un-normalized weighted sum of values, exactly what the merge needs.
+    A separate raw accumulator is required because the online softmax update at each step rescales acc by 1/l_new before adding the new contribution, so acc is already
+    the normalized output by the time the loop ends (Out = acc). If a caller took that normalized Out and multiplied it by l again during a merge, the l term would be
+    double-counted, corrupting the result. Acc_ptr instead stores acc * l_i, which recovers the un-normalized weighted sum of values, exactly what the merge needs.
 
-    Q_ptr, K_ptr, and V_ptr are as in _block_sparse_attn_fwd_kernel. Out_ptr is the [B, H_q, S_q, D] normalized output (same as the plain kernel). 
-    Acc_ptr is the [B, H_q, S_q, D] raw un-normalized accumulator (acc * l_i). M_ptr is the [B, H_q, S_q] float32 final running max logit per query, and L_ptr is the [B, H_q, S_q] 
-    float32 final running softmax denominator per query. block_indices_ptr, n_kv_blocks, scale, B, H_q, H_kv, S_q, S_kv, D, num_kv_groups, stride_*, BLOCK_M, and BLOCK_N are as in the plain kernel. 
-    Writes directly into Out_ptr, Acc_ptr, M_ptr, and L_ptr, and returns nothing.
+    Q_ptr, K_ptr, and V_ptr are as in _block_sparse_attn_fwd_kernel. Out_ptr is the [B, H_q, S_q, D] normalized output (same as the plain kernel). Acc_ptr is the [B, H_q, S_q, D] 
+    raw un-normalized accumulator (acc * l_i). M_ptr is the [B, H_q, S_q] float32 final running max logit per query, and L_ptr is the [B, H_q, S_q] float32
+    final running softmax denominator per query. block_indices_ptr, n_kv_blocks, scale, B, H_q, H_kv, S_q, S_kv, D, num_kv_groups, stride_*, BLOCK_M, and BLOCK_N are as in
+    the plain kernel. Writes directly into Out_ptr, Acc_ptr, M_ptr, and L_ptr, and returns nothing.
     """
     b = tl.program_id(0)
     h_q = tl.program_id(1)
@@ -261,8 +255,8 @@ def _block_sparse_attn_stats_kernel(
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype = tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype = tl.float32)
-    acc = tl.zeros([BLOCK_M, D], dtype = tl.float32) # Normalized (for Out)
-    raw_acc = tl.zeros([BLOCK_M, D], dtype = tl.float32) # Un-normalized (for Acc)
+    acc = tl.zeros([BLOCK_M, D], dtype = tl.float32) # Normalized (for Out).
+    raw_acc = tl.zeros([BLOCK_M, D], dtype = tl.float32) # Un-normalized (for Acc).
 
     k_base = K_ptr + b * stride_kb + h_kv * stride_kh
     v_base = V_ptr + b * stride_vb + h_kv * stride_vh
@@ -292,7 +286,8 @@ def _block_sparse_attn_stats_kernel(
         # Normalized accumulator (for Out): divided by running l at each step.
         acc = acc * (tl.exp(m_i - m_new) / l_new)[:, None] + tl.dot(exp_scores / l_new[:, None], V_tile)
 
-        # Un-normalized accumulator (for Acc): rescale previous by exp(m_old-m_new), add new contribution WITHOUT dividing by l. This gives sum(exp(s - m) * V).
+        # Un-normalized accumulator (for Acc): rescale previous by exp(m_old-m_new), add
+        # new contribution WITHOUT dividing by l. This gives sum(exp(s - m) * V).
         raw_acc = raw_acc * tl.exp(m_i - m_new)[:, None] + tl.dot(exp_scores, V_tile)
 
         m_i = m_new
@@ -322,11 +317,11 @@ def block_sparse_attention_with_stats(
     block_size: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Same as block_sparse_attention, but also returns the raw accumulator and softmax statistics needed to merge this partial result 
-    with another partial attention computation (Flash Decoding combine). Takes the same Q, K_prefix, V_prefix, block_indices, and block_size arguments as block_sparse_attention.
+    Same as block_sparse_attention, but also returns the raw accumulator and softmax statistics needed to merge this partial result with another partial attention
+    computation (Flash Decoding combine). Takes the same Q, K_prefix, V_prefix, block_indices, and block_size arguments as block_sparse_attention.
 
-    Returns Out, the [B, H_q, S_q, D] float16 normalized attention output over the K selected prefix blocks only; 
-    Acc, the [B, H_q, S_q, D] float32 raw (un-normalized) weighted sum of values; M, the [B, H_q, S_q] float32 running max logit; and L, the [B, H_q, S_q] float32 running softmax denominator.
+    Returns Out, the [B, H_q, S_q, D] float16 normalized attention output over the K selected prefix blocks only; Acc, the [B, H_q, S_q, D] float32 raw (un-normalized)
+    weighted sum of values; M, the [B, H_q, S_q] float32 running max logit; and L, the [B, H_q, S_q] float32 running softmax denominator.
     """
     B, H_q, S_q, D = Q.shape
     _, H_kv, S_kv, _ = K_prefix.shape
@@ -335,10 +330,10 @@ def block_sparse_attention_with_stats(
     scale = D ** -0.5
 
     assert S_q <= BLOCK_M, (
-        f"block_sparse_attention_with_stats: S_q={S_q} > BLOCK_M={BLOCK_M}."
+        f"block_sparse_attention_with_stats: S_q = {S_q} > BLOCK_M = {BLOCK_M}."
     )
     assert block_size == BLOCK_N, (
-        f"block_sparse_attention_with_stats: block_size={block_size} != BLOCK_N={BLOCK_N}."
+        f"block_sparse_attention_with_stats: block_size = {block_size} != BLOCK_N = {BLOCK_N}."
     )
     assert D in (64, 128, 256), f"block_sparse_attention_with_stats: unexpected head_dim {D}"
     assert block_indices.dtype == torch.int32, "block_indices must be int32"
@@ -387,20 +382,19 @@ def sparse_attn_merge(
     block_size: int = 32,
 ) -> torch.Tensor:
     """
-    Compute attention over (sparse prefix blocks via Triton) + (current generation block via manual softmax), 
-    then merge with the Flash Decoding log-sum-exp combine. No gather or concatenation of the prefix cache occurs.
+    Compute attention over (sparse prefix blocks via Triton) + (current generation block via manual softmax), then merge with the Flash Decoding log-sum-exp combine. No
+    gather or concatenation of the prefix cache occurs.
 
-    This function exists to fix a correctness bug: block_sparse_attention_with_stats returns Acc as the raw (un-normalized) 
-    weighted sum of values, i.e. Acc = sum(exp(score - m) * V), not divided by l. The merge below uses Acc directly, not Out (which is already normalized). 
-    Using Out here would double-count the l_pre denominator and silently corrupt every output, which is exactly what produced the near-zero accuracy in the earlier attempt.
+    This function exists to fix a correctness bug: block_sparse_attention_with_stats returns Acc as the raw (un-normalized) weighted sum of values, i.e. Acc = sum(exp(score - m) * V), 
+    not divided by l. The merge below uses Acc directly, not Out (which is already normalized). Using Out here would double-count the l_pre denominator and silently corrupt every output, 
+    which is exactly what produced the near-zero accuracy in the earlier attempt.
 
     The merge formula (Flash Decoding) is m = max(m_pre, m_cur), l = exp(m_pre - m) * l_pre + exp(m_cur - m) * l_cur, and o = (exp(m_pre - m) * Acc_pre + exp(m_cur - m) * Acc_cur) / l.
 
-    query_states is the [B, H_q, S_q, D] current block queries (post-RoPE). prefix_k and prefix_v are the [B, H_kv, S_prefix, D] full prefix cache, 
-    not pre-sliced. block_indices is a [B, K] int32 tensor of selected block indices (sorted), one set shared across the batch (matmul union) or per-sequence. 
-    cur_k and cur_v are the [B, H_kv, S_q, D] current block keys/values (post-RoPE). attention_mask is a float additive mask [..., S_q, S_prefix + S_q] from eval_mask(), 
-    used only for the current-block columns (last S_q columns). scaling is 1/sqrt(D), num_kv_groups is H_q // H_kv for GQA expansion, and block_size is the tokens per block, 
-    which must match BLOCK_N (default 32).
+    query_states is the [B, H_q, S_q, D] current block queries (post-RoPE). prefix_k and prefix_v are the [B, H_kv, S_prefix, D] full prefix cache, not pre-sliced.
+    block_indices is a [B, K] int32 tensor of selected block indices (sorted), one set shared across the batch (matmul union) or per-sequence. cur_k and cur_v are the [B, H_kv, S_q, D] 
+    current block keys/values (post-RoPE). attention_mask is a float additive mask [..., S_q, S_prefix + S_q] from eval_mask(), used only for the
+    current-block columns (last S_q columns). scaling is 1/sqrt(D), num_kv_groups is H_q // H_kv for GQA expansion, and block_size is the tokens per block, which must match BLOCK_N (default 32).
 
     Returns a [B, H_q, S_q, D] attention output, same dtype as query_states.
     """
@@ -412,8 +406,8 @@ def sparse_attn_merge(
         query_states, prefix_k, prefix_v, block_indices, block_size = block_size
     )
 
-    # The Triton kernel allocates output buffers of size BLOCK_M = 32 regardless of the actual query length S_q. When S_q < BLOCK_M (e.g. S_q = 8 for
-    # use_block_cache sub-block calls), positions S_q...31 contain garbage. Slice to the actual query length before the merge.
+    # The Triton kernel allocates output buffers of size BLOCK_M = 32 regardless of the actual query length S_q. When S_q < BLOCK_M (e.g. S_q = 8 for use_block_cache sub-block calls), 
+    # positions S_q...31 contain garbage. Slice to the actual query length before the merge.
     if S_q < Out_pre.shape[2]:
         Out_pre = Out_pre[:, :, :S_q, :]
         Acc_pre = Acc_pre[:, :, :S_q, :]
@@ -429,21 +423,20 @@ def sparse_attn_merge(
     )
 
     if attention_mask is not None:
-        # attention_mask was already sliced by the eviction gather path to match the selected prefix tokens. Its shape is [..., sliced_prefix + S_cur_kv].
-        # We need only the current-block columns for Pass 2.
+        # attention_mask was already sliced by the eviction gather path to match the selected prefix tokens. Its shape is [..., sliced_prefix + S_cur_kv]. We need only the current-block columns for Pass 2.
         S_prefix_in_mask = attention_mask.shape[-1] - cur_k.shape[-2]
         if S_prefix_in_mask >= 0 and S_prefix_in_mask < attention_mask.shape[-1]:
             cur_mask = attention_mask[..., S_prefix_in_mask:]
             scores_cur = scores_cur + cur_mask.to(scores_cur.dtype)
 
-    m_cur = scores_cur.max(dim = -1, keepdim = True).values.squeeze(-1) # [B, H_q, S_q]
+    m_cur = scores_cur.max(dim = -1, keepdim = True).values.squeeze(-1) # [B, H_q, S_q].
     exp_cur = torch.exp(scores_cur - m_cur.unsqueeze(-1))
-    l_cur = exp_cur.sum(dim = -1) # [B, H_q, S_q]
-    Acc_cur = torch.matmul(exp_cur, cur_v_exp.float()) # [B, H_q, S_q, D], raw (un-normalized)
+    l_cur = exp_cur.sum(dim = -1) # [B, H_q, S_q].
+    Acc_cur = torch.matmul(exp_cur, cur_v_exp.float()) # [B, H_q, S_q, D], raw (un-normalized).
 
     # Flash Decoding merge using raw accumulators (Acc_pre, Acc_cur), not the normalized Out_pre.
-    m_global = torch.maximum(M_pre, m_cur) # [B, H_q, S_q]
-    scale_pre = torch.exp(M_pre - m_global).unsqueeze(-1) # [B, H_q, S_q, 1]
+    m_global = torch.maximum(M_pre, m_cur) # [B, H_q, S_q].
+    scale_pre = torch.exp(M_pre - m_global).unsqueeze(-1) # [B, H_q, S_q, 1].
     scale_cur = torch.exp(m_cur - m_global).unsqueeze(-1)
     l_global = (torch.exp(M_pre - m_global) * L_pre + torch.exp(m_cur - m_global) * l_cur).unsqueeze(-1)
 

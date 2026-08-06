@@ -1,16 +1,15 @@
 """
 Profiling harness for one K-value generation run.
 
-Answers "where is the remaining gap between measured speedup and the theoretical eviction ceiling actually going?" with a real torch.profiler trace, 
-instead of guessing between the commit-step scoring cost and the S_q = 32 fallback path.
+Answers "where is the remaining gap between measured speedup and the theoretical eviction ceiling actually going?" with a real torch.profiler trace, instead of
+guessing between the commit-step scoring cost and the S_q = 32 fallback path.
 
-Run from DiffusionLLMs/:
-    CUDA_VISIBLE_DEVICES=0 python -m kernel.profile_eviction --k 16 --n_questions 16
+Run from KINETIC/: CUDA_VISIBLE_DEVICES=0 python -m kernel.profile_eviction --k 16 --n_questions 16
 
-Interpreting the output: look at the printed table's top rows by self CUDA time. Any op named like "aten::scaled_dot_product_attention" 
-attributable to score-capture (paired with a matmul/softmax done in eager mode rather than fused) is the commit-step double-attention cost. 
-Time in "aten::index" / "aten::cat" / "aten::repeat_interleave" ahead of "aten::scaled_dot_product_attention" is the gather+cat+repeat overhead in the S_q = 32 fallback path. 
-The exported chrome trace (profile_trace.json) can be loaded at chrome://tracing or https://ui.perfetto.dev for a visual timeline if the text table isn't enough to localize the cost.
+Interpreting the output: look at the printed table's top rows by self CUDA time. Any op named like "aten::scaled_dot_product_attention" attributable to score-capture
+(paired with a matmul/softmax done in eager mode rather than fused) is the commit-step double-attention cost. Time in "aten::index" / "aten::cat" /
+"aten::repeat_interleave" ahead of "aten::scaled_dot_product_attention" is the gather + cat + repeat overhead in the S_q = 32 fallback path. The exported chrome trace
+(profile_trace.json) can be loaded at chrome://tracing or https://ui.perfetto.dev for a visual timeline if the text table isn't enough to localize the cost.
 """
 
 import argparse
@@ -82,22 +81,24 @@ def main():
     print("\nTop ops by self CUDA time:")
     print(prof.key_averages().table(sort_by = "self_cuda_time_total", row_limit = 25))
 
-    # commit_step / small_step are record_function wrapper scopes (added in BlockEvictionScheduler._patched_forward), not real ops: almost all of
-    # their own time is spent inside child ops, so they show near-zero "self" time and won't surface in the self-time table above no matter how
-    # expensive they are. Their cuda_time_total (which does include descendants) is the number that actually answers "which of these two
-    # dominates": printed here explicitly since the table above can't show it.
+    # commit_step / small_step are record_function wrapper scopes (added in BlockEvictionScheduler._patched_forward), not real ops: almost all of their own
+    # time is spent inside child ops, so they show near-zero "self" time and won't surface in the self-time table above no matter how expensive they are. Their
+    # cuda_time_total (which does include descendants) is the number that actually answers "which of these two dominates": printed here explicitly since the table
+    # above can't show it.
     print("\nCommit-step vs small-step breakdown (total CUDA time, including all nested ops):")
     tag_totals = {}
     for evt in prof.key_averages():
         if evt.key in ("commit_step", "small_step"):
-            # Attribute name varies by torch version: newer versions generalized cuda_time_total to device_time_total as part of
-            # supporting non-CUDA accelerators. Try both rather than assume.
+            # Attribute name varies by torch version: newer versions generalized
+            # cuda_time_total to device_time_total as part of supporting non-CUDA
+            # accelerators. Try both rather than assume.
             time_us = getattr(evt, "device_time_total", None)
             if time_us is None:
                 time_us = getattr(evt, "cuda_time_total", None)
             if time_us is None:
-                time_us = evt.cpu_time_total # Last-resort fallback, not ideal but keeps this from crashing
-            tag_totals[evt.key] = (time_us / 1000.0, evt.count) # us -> ms
+                # Last-resort fallback, not ideal but keeps this from crashing.
+                time_us = evt.cpu_time_total
+            tag_totals[evt.key] = (time_us / 1000.0, evt.count) # us -> ms.
     if not tag_totals:
         print("(No tagged commit_step/small_step events found: is this an up-to-date "
               "block_eviction_scheduler.py with the record_function tagging?)")

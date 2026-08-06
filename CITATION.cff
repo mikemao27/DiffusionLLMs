@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use the KINETIC custom kernel or any of the ideas presented here, please cite them as follows."
+type: software
+title: "KINETIC: KV-Informed Neural Inference and Token-Skipping Execution Core"
+abstract: >
+  KINETIC is a project with the aim of producing substantial wall-clock speedups on existing diffusion large-language models like Fast-dLLM v2 (NVIDIA).
+  The framework integrates ideas of KV-caches, token-skipping policies, block-eviction policies, and custom Python kernels written in Triton to produce 
+  substantial wall-clock speedups against Fast-dLLM v2 when run exclusively on a set of 10 NVIDIA RTX Pro 6000 GPUs (only one was used at a time).
+authors:
+  - family-names: "Mao"
+    given-names: "Mike"
+    email: "mikemao1027@gmail.com"
+    affiliation: "Rice University"
+repository-code: "https://github.com/mikemao27/KINETIC"
+license: Apache-2.0
+version: "1.0.0"
+keywords: 
+  - "diffusion large-language models"
+  - "custom python kernel"
+  - "kv-cache"
+  - "token-skipping policy"
+  - "wall-clock speedup"
+  - "block-evicton policy"
