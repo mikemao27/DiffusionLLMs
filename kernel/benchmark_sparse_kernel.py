@@ -9,8 +9,8 @@ Run from KINETIC/ with the kernel/ package on the path: CUDA_VISIBLE_DEVICES=0 p
 
 Interpreting the output: if the sparse path's per-call latency is higher than the fallback's at S_q = 8 (the dominant call shape), that directly 
 confirms the kernel's fixed overhead (launch cost + wasted 32-wide tile for an 8-wide query) outweighs its HBM savings at this problem size, matching 
-the K = 16 GSM8K result where hit_rate = 99.9% but throughput dropped. If S_q = 32 (block-rebuild calls) shows the sparse path winning while S_q = 8 shows 
-it losing, that pinpoints the BLOCK_M = 32 tile-sizing waste specifically, since that call shape uses the full tile with no waste.
+the K = 16 GSM8K result where hit_rate = 99.9% but throughput dropped. If S_q = 32 (block-rebuild calls) shows the sparse path winning while S_q = 8
+shows it losing, that pinpoints the BLOCK_M = 32 tile-sizing waste specifically, since that call shape uses the full tile with no waste.
 """
 
 import time

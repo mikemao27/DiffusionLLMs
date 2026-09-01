@@ -12,9 +12,7 @@
 
 </div>
 
-**KINETIC** is a project developing a custom Triton kernel for **KV cache block eviction** and **block-sparse attention**, targeting inference speedups for [Fast-dLLM v2](https://github.com/NVlabs/Fast-dLLM), a masked diffusion language model that generates text block-by-block rather than token-by-token. The aim is to bound prefix attention cost to a fixed top-K block budget instead of letting it grow linearly with sequence length, without sacrificing the accuracy of the underlying model.
-
-*We're currently at a 1.41x wall-clock speedup with no accuracy loss relative to baseline, working toward a 2x target. The approach pairs an eviction scheduler that scores and retains only the most important prefix KV blocks with a Triton kernel that reads only those selected blocks from HBM, and experiments with INT8 weight quantization to attack the GEMM-bound cost that remains once attention is no longer the bottleneck.*
+**KINETIC** is a project developing a custom Triton kernel for **KV cache block eviction** and **block-sparse attention**, targeting inference speedups for [Fast-dLLM v2](https://github.com/NVlabs/Fast-dLLM), a masked diffusion language model that generates text block-by-block rather than token-by-token. The aim is to bound prefix attention cost to a fixed top-K block budget instead of letting it grow linearly with sequence length, without sacrificing the accuracy of the underlying model. Runtime wall-clock speedups on Fast-dLLM v2 and GSM8K should lie around the 1.3-1.4x range. Accuracy levels should also remain similar to the baseline accuracy at 70-80% (with 80% being slightly higher than the baseline).
 
 > [!IMPORTANT]
 > This kernel modifies the model's attention computation and KV cache handling. Any change to the eviction scheduler, block scoring, or sparse kernel path should be checked against the no-op correctness gate (`kernel/test_eviction.py --mode noop`) before being trusted on a real accuracy sweep.

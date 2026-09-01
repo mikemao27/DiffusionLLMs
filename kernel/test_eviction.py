@@ -1,21 +1,21 @@
 """
 Test and Evaluation Harness for KV Block Eviction.
 
-Verifies the eviction hook is a correctness no-op at K = N, then measures accuracy and throughput across a range of K values on GSM8K. There are two entry points.
+Verifies the eviction hook is a correctness no-op at K = N, then measures accuracy and throughput across a range of K values on GSM8K. There are two
+entry points.
 
-    python test_eviction.py --mode noop
+python test_eviction.py --mode noop
 
-No-op correctness gate. Runs baseline and K = N+10 side-by-side on GSM8K examples. Output must be token-identical. If this fails, no K-sweep result can be trusted.
+No-op correctness gate. Runs baseline and K = N+10 side-by-side on GSM8K examples. Output must be token-identical. If this fails, no K-sweep result can 
+be trusted.
 
-    python test_eviction.py --mode eval [--k_values 4 8 16 32] [--n_questions 80]
+python test_eviction.py --mode eval [--k_values 4 8 16 32] [--n_questions 80]
 
 Accuracy + throughput sweep over multiple K values on GSM8K.
 
-Run from KINETIC/: 
-
-    CUDA_VISIBLE_DEVICES=0 python -m kernel.test_eviction --mode noop
-    CUDA_VISIBLE_DEVICES=0 python -m kernel.test_eviction --mode eval \\
-    --k_values 8 16 32 --n_questions 80 --batch_size 32 --union_mode matmul
+CUDA_VISIBLE_DEVICES=0 python -m kernel.test_eviction --mode noop
+CUDA_VISIBLE_DEVICES=0 python -m kernel.test_eviction --mode eval \\
+--k_values 8 16 32 --n_questions 80 --batch_size 32 --union_mode matmul
 """
 
 import re
@@ -37,17 +37,17 @@ FILLER_SENTENCE = "The quick brown fox jumps over the lazy dog. "
 
 def load_model(model_path, device = "cuda:0", fuse_projections = False, compile_model = False):
     """
-    Load Fast-dLLM v2 from kernel.modeling and inject the batch_sample generation method. Using kernel.modeling gives us the eviction hooks directly in the attention
-    forward without trust_remote_code.
+    Load Fast-dLLM v2 from kernel.modeling and inject the batch_sample generation method. Using kernel.modeling gives us the eviction hooks directly in 
+    the attention forward without trust_remote_code.
 
-    model_path is the HuggingFace repo ID or local path, and device is the target CUDA device string. fuse_projections, if True, fuses each layer's QKV and gate+up
-    projections into single matmuls after loading (see kernel.modeling.fuse_all_projections). Mathematically exact, verified independently
-    in /home/claude/verify_fusion_math.py, but this is its first time running against the real checkpoint and the full generation loop, so treat the first eval sweep with
-    this flag as a smoke test too, same as with the quantization loading path. compile_model, if True, wraps model.forward with torch.compile(dynamic = True).
-    Experimental: the generation loop's Python-level branching (use_block_cache, training vs eval, mask-shape-dependent paths) and the shrinking batch dimension as
-    samples finish mid-generation are exactly the kind of dynamic control flow that can cause graph breaks or frequent recompilation. Watch stderr for recompilation
-    warnings on the first run: if compilation time dominates, most of any expected speedup will be hidden in that one-time (or repeated) cost rather than showing up in
-    the reported tok/s.
+    model_path is the HuggingFace repo ID or local path, and device is the target CUDA device string. fuse_projections, if True, fuses each layer's QKV 
+    and gate + up projections into single matmuls after loading (see kernel.modeling.fuse_all_projections). Mathematically exact, verified independently
+    in /home/claude/verify_fusion_math.py, but this is its first time running against the real checkpoint and the full generation loop, so treat the 
+    first eval sweep with this flag as a smoke test too, same as with the quantization loading path. compile_model, if True, wraps model.forward with 
+    torch.compile(dynamic = True). Experimental: the generation loop's Python-level branching (use_block_cache, training vs eval, mask-shape-dependent 
+    paths) and the shrinking batch dimension as samples finish mid-generation are exactly the kind of dynamic control flow that can cause graph breaks 
+    or frequent recompilation. Watch stderr for recompilation warnings on the first run: if compilation time dominates, most of any expected speedup 
+    will be hidden in that one-time (or repeated) cost rather than showing up in the reported tok/s.
 
     Returns the loaded model, in eval mode, with .mdm_sample bound.
     """
@@ -68,11 +68,12 @@ def _build_filler_ids(tokenizer, min_tokens):
     """
     Builds a filler token-id tensor with at least min_tokens tokens by repeating FILLER_SENTENCE, doubling the repeat count until long enough.
 
-    This exists because a fixed-size filler constant silently caps out at whatever it tokenizes to: past that length, _make_prompt pads with everything available and
-    stops, with no error, producing a prompt far shorter than the requested target_ctx_len. Building the filler on demand means --context_len works correctly at
-    any length, including ones larger than previously tested.
+    This exists because a fixed-size filler constant silently caps out at whatever it tokenizes to: past that length, _make_prompt pads with everything 
+    available and stops, with no error, producing a prompt far shorter than the requested target_ctx_len. Building the filler on demand means --context_len 
+    works correctly at any length, including ones larger than previously tested.
 
-    tokenizer is the model tokenizer, and min_tokens is the minimum number of filler tokens required. Returns a 1-D LongTensor of at least min_tokens token ids.
+    tokenizer is the model tokenizer, and min_tokens is the minimum number of filler tokens required. Returns a 1-D LongTensor of at least min_tokens 
+    token ids.
     """
     reps = max(200, (min_tokens // 8) + 1) # ~8 tokens/sentence, rough starting guess.
     while True:
@@ -83,9 +84,9 @@ def _build_filler_ids(tokenizer, min_tokens):
 
 def _make_prompt(tokenizer, question, target_ctx_len = None):
     """
-    Build a chat-templated prompt for a GSM8K question. If target_ctx_len is given, prepend filler so the prompt reaches approximately that many tokens, putting the
-    model in a long-context regime where block eviction has real blocks to prune. tokenizer is the model tokenizer, question is the raw question string, and
-    target_ctx_len is an optional token count to pad the prompt to. Returns the chat-templated prompt string.
+    Build a chat-templated prompt for a GSM8K question. If target_ctx_len is given, prepend filler so the prompt reaches approximately that many tokens, 
+    putting the model in a long-context regime where block eviction has real blocks to prune. tokenizer is the model tokenizer, question is the raw 
+    question string, and target_ctx_len is an optional token count to pad the prompt to. Returns the chat-templated prompt string.
     """
     filler_prefix = ""
     if target_ctx_len is not None:
@@ -116,8 +117,9 @@ def _extract_gsm8k_answer(text):
 
 def _check_answer(generated, ground_truth):
     """
-    Checks a generated answer against ground truth. Prefers an explicit "#### N" marker in the generation; falls back to the last number mentioned if no marker is present.
-    generated is the model's generated text, and ground_truth is the reference answer string, or None (unscored sample). Returns True/False if scored, or None if ground_truth was None.
+    Checks a generated answer against ground truth. Prefers an explicit "#### N" marker in the generation; falls back to the last number mentioned if 
+    no marker is present. generated is the model's generated text, and ground_truth is the reference answer string, or None (unscored sample). Returns 
+    True/False if scored, or None if ground_truth was None.
     """
     if ground_truth is None:
         return None
@@ -129,8 +131,9 @@ def _check_answer(generated, ground_truth):
 
 def load_gsm8k_batched(n, tokenizer, device, batch_size, target_ctx_len = None):
     """
-    Load n GSM8K test questions and batch them with left-padding. n is the number of questions to load, tokenizer is the model tokenizer, and device is the CUDA device
-    string. batch_size is the number of questions per batch, and target_ctx_len is an optional token count to pad prompts to. Returns a list of (encoded_batch, answers) tuples.
+    Load n GSM8K test questions and batch them with left-padding. n is the number of questions to load, tokenizer is the model tokenizer, and device is 
+    the CUDA device string. batch_size is the number of questions per batch, and target_ctx_len is an optional token count to pad prompts to. Returns a 
+    list of (encoded_batch, answers) tuples.
     """
     ds = load_dataset("gsm8k", "main", split = "test")
     questions = ds[:n]["question"]
@@ -159,12 +162,13 @@ def load_gsm8k_batched(n, tokenizer, device, batch_size, target_ctx_len = None):
 
 def warm_up_model(model, tokenizer, device):
     """
-    Runs one small, untimed generation call to absorb one-time costs (CUDA context growth, cuDNN algorithm selection, memory allocator warm-up) that would otherwise
-    land inside whichever measurement happens to run first.
+    Runs one small, untimed generation call to absorb one-time costs (CUDA context growth, cuDNN algorithm selection, memory allocator warm-up) that 
+    would otherwise land inside whichever measurement happens to run first.
 
-    This matters because, across repeated eval-sweep runs, the K-value throughput numbers were consistently stable (within ~0.3% run to run) while the baseline
-    (full-prefix, always measured first) varied by up to ~26%. That pattern, stable everywhere except the first timed call in the process, is the signature of warm-up
-    cost, not GPU contention or thermal state. Running a throwaway generation before any timed measurement keeps that cost out of the results entirely.
+    This matters because, across repeated eval-sweep runs, the K-value throughput numbers were consistently stable (within ~0.3% run to run) while the 
+    baseline (full-prefix, always measured first) varied by up to ~26%. That pattern, stable everywhere except the first timed call in the process, is 
+    the signature of warm-up cost, not GPU contention or thermal state. Running a throwaway generation before any timed measurement keeps that cost out 
+    of the results entirely.
 
     model is a model instance with mdm_sample bound, tokenizer is the model tokenizer, and device is the CUDA device string. Returns nothing.
     """
@@ -188,13 +192,15 @@ def run_generation(
     """
     Run batch_sample on a single input_ids tensor.
 
-    model is a model instance with mdm_sample bound, tokenizer is the model tokenizer, and input_ids is a [B, L] token tensor on the correct device. max_new_tokens is the
-    maximum tokens to generate, threshold is the unmasking confidence threshold, and temperature is the sampling temperature (0 = greedy). small_block_size is the tokens
-    unmasked together within a block, and must evenly divide BLOCK_SIZE (32): valid values are 1, 2, 4, 8, 16, 32. Smaller values mean more, smaller sub-block forward
-    calls per block; larger values mean fewer, bigger ones. num_small_blocks = BLOCK_SIZE // small_block_size is the minimum number of forward calls per block,
-    regardless of how confidently the model unmasks: this is the floor that threshold tuning alone cannot go below.
+    model is a model instance with mdm_sample bound, tokenizer is the model tokenizer, and input_ids is a [B, L] token tensor on the correct device.
+    max_new_tokens is the maximum tokens to generate, threshold is the unmasking confidence threshold, and temperature is the sampling temperature 
+    (0 = greedy). small_block_size is the tokens unmasked together within a block, and must evenly divide BLOCK_SIZE (32): valid values are 1, 2, 4, 8, 
+    16, 32. Smaller values mean more, smaller sub-block forward calls per block; larger values mean fewer, bigger ones. num_small_blocks = BLOCK_SIZE // 
+    small_block_size is the minimum number of forward calls per block, regardless of how confidently the model unmasks: this is the floor that threshold 
+    tuning alone cannot go below.
 
-    Returns ordered, a list of output token tensors, one per input row, each containing the full sequence including the prompt, and elapsed, the wall-clock seconds for the generation call.
+    Returns ordered, a list of output token tensors, one per input row, each containing the full sequence including the prompt, and elapsed, the 
+    wall-clock seconds for the generation call.
     """
     plen = input_ids.shape[1]
     seq_len = torch.full((input_ids.shape[0],), plen, dtype = torch.long, device = input_ids.device)
@@ -210,6 +216,12 @@ def run_generation(
         seq_len = seq_len,
         threshold = threshold,
         temperature = temperature,
+        # Without this, batch_sample's use_block_cache defaults to False, and every small-step forward call takes generation_functions.py's non-cache 
+        # branch, which always queries the FULL block_size = 32 width regardless of small_block_size. That defeats modeling.py's is_subblock_call gate
+        # (query_states.shape[-2] < cur_block_kv_width) unconditionally, so the sparse kernel path -- sparse_attn_merge before, 
+        # block_sparse_attention_fused now, can never fire: hit_rate is 0% for every K and batch size, regardless of which kernel is wired in. 
+        # small_block_size only has any effect (on call count, or on which kernel path gets exercised) when this is True.
+        use_block_cache = True,
     )
     elapsed = time.perf_counter() - t0
 
@@ -227,9 +239,10 @@ def run_noop_test(
     use_sparse_kernel = False,
 ):
     """
-    Verify K = N+10 produces token-identical output to the baseline. model is a model instance with mdm_sample bound, tokenizer is the model tokenizer, and device is the
-    CUDA device string. n_examples is the number of GSM8K questions to test, and context_len is an optional token count to pad prompts to. union_mode is the union
-    strategy passed to BlockEvictionScheduler, and use_sparse_kernel controls whether to also exercise the Triton sparse kernel path during the no-op check.
+    Verify K = N+10 produces token-identical output to the baseline. model is a model instance with mdm_sample bound, tokenizer is the model tokenizer, 
+    and device is the CUDA device string. n_examples is the number of GSM8K questions to test, and context_len is an optional token count to pad 
+    prompts to. union_mode is the union strategy passed to BlockEvictionScheduler, and use_sparse_kernel controls whether to also exercise the Triton 
+    sparse kernel path during the no-op check.
 
     Returns True if every example was token-identical to baseline, else False.
     """
@@ -311,12 +324,12 @@ def run_eval_sweep(
     """
     Sweep over k_values and compare accuracy + throughput against the dense baseline.
 
-    model is a model instance with mdm_sample bound, tokenizer is the model tokenizer, and device is the CUDA device string. k_values is the list of K values to evaluate,
-    n_questions is the number of GSM8K questions to evaluate on, and batch_size is the questions per batch. context_len is an optional token count to pad prompts to, and
-    union_mode is the union strategy passed to BlockEvictionScheduler. threshold is the unmasking confidence threshold, temperature is the sampling temperature (0 =
-    greedy), and max_new_tokens is the maximum tokens to generate per question. use_sparse_kernel controls whether to use the Triton sparse kernel path.
-    small_block_size is the tokens unmasked together within a block and must evenly divide BLOCK_SIZE (32); see run_generation for why this, not threshold, is the lever
-    that reduces the minimum forward-call count per block.
+    model is a model instance with mdm_sample bound, tokenizer is the model tokenizer, and device is the CUDA device string. k_values is the list of 
+    K values to evaluate, n_questions is the number of GSM8K questions to evaluate on, and batch_size is the questions per batch. context_len is an 
+    optional token count to pad prompts to, and union_mode is the union strategy passed to BlockEvictionScheduler. threshold is the unmasking 
+    confidence threshold, temperature is the sampling temperature (0 = greedy), and max_new_tokens is the maximum tokens to generate per question. 
+    use_sparse_kernel controls whether to use the Triton sparse kernel path. small_block_size is the tokens unmasked together within a block and must 
+    evenly divide BLOCK_SIZE (32); see run_generation for why this, not threshold, is the lever that reduces the minimum forward-call count per block.
 
     Returns a list of (k, accuracy, tok_per_sec, speedup, frac_kv_loaded) tuples, one per value in k_values.
     """
@@ -328,8 +341,8 @@ def run_eval_sweep(
 
     def evaluate_k(k):
         """
-        Runs the full batch set once, either at the dense baseline (k = None) or with a BlockEvictionScheduler installed at the given k. Returns (accuracy, tok_per_sec, avg_frac_loaded, sparse_diag) 
-        where sparse_diag is (hits, misses, hit_rate, rebuild_misses).
+        Runs the full batch set once, either at the dense baseline (k = None) or with a BlockEvictionScheduler installed at the given k. Returns 
+        (accuracy, tok_per_sec, avg_frac_loaded, sparse_diag) where sparse_diag is (hits, misses, hit_rate, rebuild_misses).
         """
         correct = 0
         total = 0
